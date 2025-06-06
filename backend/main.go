@@ -35,6 +35,8 @@ type pendingBet struct {
 	TaskTitle     string
 	Deadline      string
 	WagerAmount   int64
+	ProofURL      string // Add this - just a file path
+	Status        string // Add this to track state
 }
 
 type paymentVerfication struct {
@@ -78,6 +80,14 @@ func main() {
 	// Create a new bet and Razorpay order
 	router.POST("/api/bet/create", createBet)
 
+	//find a bet by id and the bet id will be send to the user by email
+	router.GET("/api/bet/:id", findBet)
+
+	//route to submit proof
+	router.POST("/api/bet/:id", uploadProof)
+
+	router.POST("/api/verify/:id", verifyProof)
+
 	// verify payment with client-side callback
 	router.POST("/api/razorpay/webhook", paymentVerification)
 
@@ -114,6 +124,7 @@ func createBet(c *gin.Context) {
 		TaskTitle:     req.TaskTitle,
 		Deadline:      req.Deadline,
 		WagerAmount:   req.WagerAmount * 100,
+		Status:        "pending",
 	}
 
 	//send Id to frontend
@@ -154,8 +165,94 @@ func paymentVerification(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"message": "created the bet successfully, please wait for conformation email."})
 }
 
+func findBet(c *gin.Context) {
+
+	betID := c.Param("id")
+
+	bet, ok := betStore[betID]
+	if !ok {
+		c.JSON(http.StatusNotFound, gin.H{"message": "cannot find the bet"})
+		return
+	}
+
+	c.JSON(http.StatusFound, gin.H{"message": "success", "bet": bet})
+
+}
+
+func uploadProof(c *gin.Context) {
+	betID := c.Param("id")
+
+	bet, exists := betStore[betID]
+	if !exists {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Bet not found"})
+		return
+	}
+
+	file, err := c.FormFile("proof")
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "No file uploaded"})
+		return
+	}
+
+	filename := fmt.Sprintf("%s_%s", betID, file.Filename)
+	filepath := fmt.Sprintf("./uploads/%s", filename)
+
+	if err := c.SaveUploadedFile(file, filepath); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to save file"})
+		return
+	}
+
+	bet.ProofURL = filepath
+	bet.Status = "proof_submitted"
+
+	betStore[betID] = bet
+
+	//TODO:send email to verifier
+
+	c.JSON(http.StatusOK, gin.H{"message": "Proof uploaded successfully"})
+}
+
+func verifyProof(c *gin.Context) {
+	betID := c.Param("id")
+	var payload struct {
+		Approved bool `json:"approved"`
+	}
+
+	if err := c.BindJSON(&payload); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request body"})
+		return
+	}
+
+	bet, exists := betStore[betID]
+	if !exists {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Bet not found"})
+		return
+	}
+
+	if bet.Status != "proof_submitted" {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Proof not submitted"})
+		return
+	}
+
+	fmt.Println(payload)
+
+	if payload.Approved {
+		bet.Status = "approved"
+	} else {
+		bet.Status = "rejected"
+	}
+
+	betStore[betID] = bet
+	c.JSON(http.StatusOK, gin.H{"message": "Verifier decision recorded", "status": bet.Status})
+}
+
+// helper functions
 // custom razorpay function which returns the id
 func executerazorpay(amount int64, betID string) (string, error) {
+
+	if os.Getenv("DEBUG") == "true" {
+		return "order_debug_fake123", nil
+	}
 
 	client := razorpay.NewClient(RAZORPAY_ID, RAZORPAY_SECRET)
 
@@ -176,6 +273,12 @@ func executerazorpay(amount int64, betID string) (string, error) {
 // custom razorpay function to verify if the payment has been done or not
 // we should get orderId, paymentId, signature form user and verify
 func RazorPaymentVerification(sign, orderId, paymentId string) error {
+
+	if os.Getenv("DEBUG") == "true" {
+		fmt.Println("DEBUG: Skipping rzp signature verification ")
+		return nil
+	}
+
 	signature := sign
 	secret := RAZORPAY_SECRET
 	data := orderId + "|" + paymentId
