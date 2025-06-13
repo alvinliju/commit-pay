@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"crypto/subtle"
@@ -17,6 +18,9 @@ import (
 	"github.com/google/uuid"
 	"github.com/joho/godotenv"
 	"github.com/razorpay/razorpay-go"
+	"github.com/resend/resend-go/v2"
+	"go.mongodb.org/mongo-driver/mongo"
+	"go.mongodb.org/mongo-driver/mongo/options"
 )
 
 // info we need to create a bet bettor email, verifier email, task, deadline, wager amount
@@ -30,6 +34,7 @@ type createBetRequest struct {
 }
 
 type pendingBet struct {
+	BetID         string
 	BettorEmail   string
 	VerifierEmail string
 	TaskTitle     string
@@ -37,6 +42,18 @@ type pendingBet struct {
 	WagerAmount   int64
 	ProofURL      string // Add this - just a file path
 	Status        string // Add this to track state
+}
+
+type Bet struct {
+	ID            string `json:"id"`
+	BettorEmail   string `json:"bettorEmail"`
+	VerifierEmail string `json:"verifierEmail"`
+	TaskTitle     string `json:"taskTitle"`
+	Deadline      string `json:"deadline"`
+	WagerAmount   int64  `json:"wagerAmount"`
+	ProofURL      string `json:"proofURL"`
+	Status        string `json:"status"` // "pending_payment", "active", "proof_submitted", "approved", "rejected"
+	CreatedAt     string `json:"createdAt"`
 }
 
 type paymentVerfication struct {
@@ -49,10 +66,27 @@ type paymentVerfication struct {
 var tempBetStore = make(map[string]pendingBet)
 
 // temp store for Bets
-var betStore = make(map[string]pendingBet) //i know i should create another struct for this but ig it works and its temp anyways so...
+var betStore = make(map[string]Bet) //i know i should create another struct for this but ig it works and its temp anyways so...
 
 var RAZORPAY_ID string
 var RAZORPAY_SECRET string
+var MONGO_URI string
+var RESEND_API string
+
+// db integration
+var mongoClient *mongo.Client
+var db *mongo.Database
+
+func initMongo() {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	client, err := mongo.Connect(ctx, options.Client().ApplyURI(MONGO_URI))
+	if err != nil {
+		log.Fatal(err)
+	}
+	mongoClient = client
+	db = client.Database("commitpay")
+}
 
 func main() {
 	router := gin.Default()
@@ -73,6 +107,7 @@ func main() {
 
 	RAZORPAY_ID = os.Getenv("RAZORPAY_ID")
 	RAZORPAY_SECRET = os.Getenv("RAZORPAY_SECRET")
+	RESEND_API = os.Getenv("RESEND_API")
 
 	// health checker shit
 	router.GET("/ping", fuckit)
@@ -102,14 +137,15 @@ func createBet(c *gin.Context) {
 	//get the json data
 	var req createBetRequest
 	if err := c.BindJSON(&req); err != nil {
+		fmt.Println(req)
 		c.JSON(http.StatusBadRequest, gin.H{"message": "Invalid request"})
 		return
 	}
 
 	fmt.Print(req)
 
-	betID := uuid.NewString()
 	amount := req.WagerAmount * 100
+	betID := uuid.NewString()
 
 	//call executeRazorpay function and create an id
 	rzp_orderId, err := executerazorpay(amount, betID)
@@ -119,6 +155,7 @@ func createBet(c *gin.Context) {
 	}
 
 	tempBetStore[rzp_orderId] = pendingBet{
+		BetID:         "",
 		BettorEmail:   req.BettorEmail,
 		VerifierEmail: req.VerifierEmail,
 		TaskTitle:     req.TaskTitle,
@@ -128,12 +165,13 @@ func createBet(c *gin.Context) {
 	}
 
 	//send Id to frontend
-	c.JSON(http.StatusOK, gin.H{"message": "success", "order_id": rzp_orderId, "betId": betID, "amount": amount})
+	c.JSON(http.StatusOK, gin.H{"message": "success", "order_id": rzp_orderId, "amount": amount})
 }
 
 func paymentVerification(c *gin.Context) {
 	var req paymentVerfication
 
+	fmt.Println(req)
 	if err := c.BindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"message": "Invalid request"})
 		return
@@ -150,17 +188,49 @@ func paymentVerification(c *gin.Context) {
 		return
 	}
 
-	betStore[req.RazorpayOrderID] = pendingBet{
+	betID := uuid.NewString()
+
+	bet := Bet{
+		ID:            betID,
 		BettorEmail:   pb.BettorEmail,
 		VerifierEmail: pb.VerifierEmail,
 		TaskTitle:     pb.TaskTitle,
 		Deadline:      pb.Deadline,
 		WagerAmount:   pb.WagerAmount,
+		ProofURL:      "",
+		Status:        "active",
+		CreatedAt:     time.Now().Format(time.RFC3339),
 	}
 
+	betStore[betID] = bet
 	delete(tempBetStore, req.RazorpayOrderID)
 
 	fmt.Println(betStore[req.RazorpayOrderID])
+
+	bettorSubject := "Your bet has been placed!"
+	bettorContent := fmt.Sprintf(`
+        <h1>CommitPay Bet Confirmation</h1>
+        <p>You've placed a bet of ₹%d to complete: <b>%s</b></p>
+        <p>Deadline: %s</p>d
+        <p>Manage your bet: <a href="http://localhost:3000/bet/?id=%s">View Bet</a></p>
+    `, pb.WagerAmount/100, pb.TaskTitle, pb.Deadline, betID)
+
+	veriferSubject := "You've been chosen as a verifier on CommitPay by your friend"
+	verifierContent := fmt.Sprintf(`
+			<h2>You're a Verifier! 🔍</h2>
+			<p><strong>%s</strong> has bet ₹%d that they'll complete:</p>
+			<h3>"%s"</h3>
+			<p><strong>Deadline:</strong> %s</p>
+
+			<p>When they submit proof, you'll get an email to verify if they actually completed the task.</p>
+			<p>This is real money on the line - be honest but fair in your judgment.</p>
+
+			<p><a href="http://localhost:3000/verify/%s">View Bet Details</a></p>
+		`, bet.BettorEmail, bet.WagerAmount/100, bet.TaskTitle, bet.Deadline, bet.ID)
+
+	go sendEmail(pb.VerifierEmail, veriferSubject, verifierContent)
+
+	go sendEmail(pb.BettorEmail, bettorSubject, bettorContent)
 
 	c.JSON(http.StatusOK, gin.H{"message": "created the bet successfully, please wait for conformation email."})
 }
@@ -168,6 +238,8 @@ func paymentVerification(c *gin.Context) {
 func findBet(c *gin.Context) {
 
 	betID := c.Param("id")
+
+	fmt.Println("id ivide", betID)
 
 	bet, ok := betStore[betID]
 	if !ok {
@@ -207,7 +279,23 @@ func uploadProof(c *gin.Context) {
 
 	betStore[betID] = bet
 
+	subject := fmt.Sprintf("Action Required: Verify proof for ₹%d  bet", bet.WagerAmount)
+	content := fmt.Sprintf(`
+			<h2>%s just submitted proof for their bet:</h2>
+			<p><strong>%s</strong> has bet ₹%d that they'll complete:</p>
+			<h3>Task:"%s"</h3>
+			<p><strong>Deadline:</strong> %s</p>
+
+			<p>=PROOF SUBMITTED: %s</p>
+			<p>This is real money on the line - be honest but fair in your judgment.</p>
+			<p>Did they actually complete this task?</p>
+
+			<p>These buttons should work until Dec 15, 2024. </p>
+
+		`, bet.BettorEmail, bet.WagerAmount/100, bet.TaskTitle, bet.Deadline, bet.ID)
+
 	//TODO:send email to verifier
+	go sendEmail(bet.BettorEmail, subject, content)
 
 	c.JSON(http.StatusOK, gin.H{"message": "Proof uploaded successfully"})
 }
@@ -244,6 +332,30 @@ func verifyProof(c *gin.Context) {
 
 	betStore[betID] = bet
 	c.JSON(http.StatusOK, gin.H{"message": "Verifier decision recorded", "status": bet.Status})
+}
+
+func sendEmail(email string, subject string, content string) bool {
+	client := resend.NewClient(RESEND_API)
+
+	params := &resend.SendEmailRequest{
+		From:    "founder@commitpay.xyz",
+		To:      []string{email},
+		Html:    content,
+		Subject: subject,
+		Cc:      []string{"cc@example.com"},
+		Bcc:     []string{"bcc@example.com"},
+		ReplyTo: "replyto@example.com",
+	}
+
+	sent, err := client.Emails.Send(params)
+	if err != nil {
+		fmt.Println(err)
+		return false
+	}
+
+	_ = sent
+
+	return true
 }
 
 // helper functions
