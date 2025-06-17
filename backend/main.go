@@ -121,7 +121,7 @@ func main() {
 	//route to submit proof
 	router.POST("/api/bet/:id", uploadProof)
 
-	router.POST("/api/verify/:id", verifyProof)
+	router.GET("/api/verify", verifyProof)
 
 	// verify payment with client-side callback
 	router.POST("/api/razorpay/webhook", paymentVerification)
@@ -282,8 +282,8 @@ func uploadProof(c *gin.Context) {
 
 	betStore[betID] = bet
 
-	approveURL := fmt.Sprintf("http://localhost:8080/api/verify/?=id%s?action=approve", bet.ID)
-	rejectURL := fmt.Sprintf("http://localhost:8080/api/verify/?id=%s?action=reject", bet.ID)
+	approveURL := fmt.Sprintf("http://localhost:8080/api/verify?id=%s&action=approve", bet.ID)
+	rejectURL := fmt.Sprintf("http://localhost:8080/api/verify?id=%s&action=reject", bet.ID)
 
 	subject := fmt.Sprintf("Action Required: Verify proof for ₹%d  bet", bet.WagerAmount)
 	content := fmt.Sprintf(`
@@ -297,7 +297,7 @@ func uploadProof(c *gin.Context) {
 			<p>Did they actually complete this task?</p>
 
 			<p>These buttons should work until Dec %s. </p>
-			<a href=%s > accept ✅ </a>
+			<a href=%s > accept ✅ </a><br>
 			<a href=%s > reject ❌ </a>
 
 		`, bet.BettorEmail, bet.TaskTitle, bet.Deadline, bet.ProofURL, bet.Deadline, approveURL, rejectURL)
@@ -309,8 +309,8 @@ func uploadProof(c *gin.Context) {
 }
 
 func verifyProof(c *gin.Context) {
-	betID := c.Param("id")
-	action := c.Param("action")
+	betID := c.Query("id")
+	action := c.Query("action")
 
 	bet, exists := betStore[betID]
 	if !exists {
@@ -318,16 +318,15 @@ func verifyProof(c *gin.Context) {
 		return
 	}
 
-	if bet.Status != "proof_submitted" {
-		c.JSON(http.StatusNotFound, gin.H{"error": "Proof not submitted"})
-		return
-	}
-
-	if action == "approve" {
-		bet.Status = "approved"
-	} else {
-		bet.Status = "rejected"
-	}
+	switch {
+    case bet.Status == "proof_submitted" && action == "approve":
+        bet.Status = "approved"
+    case bet.Status == "proof_submitted" && action == "reject":
+        bet.Status = "rejected"
+    default:
+        c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid action for current state"})
+        return
+    }
 
 	betStore[betID] = bet
 	c.JSON(http.StatusOK, gin.H{"message": "Verifier decision recorded", "status": bet.Status})
