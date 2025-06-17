@@ -126,6 +126,9 @@ func main() {
 	// verify payment with client-side callback
 	router.POST("/api/razorpay/webhook", paymentVerification)
 
+	//serving uploaded files
+	router.Static("/uploads", "./uploads")
+
 	router.Run() // listen and serve on 0.0.0.0:8080
 }
 
@@ -279,37 +282,35 @@ func uploadProof(c *gin.Context) {
 
 	betStore[betID] = bet
 
+	approveURL := fmt.Sprintf("http://localhost:8080/api/verify/?=id%s?action=approve", bet.ID)
+	rejectURL := fmt.Sprintf("http://localhost:8080/api/verify/?id=%s?action=reject", bet.ID)
+
 	subject := fmt.Sprintf("Action Required: Verify proof for ₹%d  bet", bet.WagerAmount)
 	content := fmt.Sprintf(`
 			<h2>%s just submitted proof for their bet:</h2>
-			<p><strong>%s</strong> has bet ₹%d that they'll complete:</p>
-			<h3>Task:"%s"</h3>
+			<h2>The amount is wager amount is: <strong>%s</strong></h2>
 			<p><strong>Deadline:</strong> %s</p>
 
-			<p>=PROOF SUBMITTED: %s</p>
+			<p><strong>PROOF:</strong></p>
+			<img src="%s" alt="proof" style="max-width: 100%%; border: 1px solid #ccc;" />
 			<p>This is real money on the line - be honest but fair in your judgment.</p>
 			<p>Did they actually complete this task?</p>
 
-			<p>These buttons should work until Dec 15, 2024. </p>
+			<p>These buttons should work until Dec %s. </p>
+			<a href=%s > accept ✅ </a>
+			<a href=%s > reject ❌ </a>
 
-		`, bet.BettorEmail, bet.WagerAmount/100, bet.TaskTitle, bet.Deadline, bet.ID)
+		`, bet.BettorEmail, bet.TaskTitle, bet.Deadline, bet.ProofURL, bet.Deadline, approveURL, rejectURL)
 
 	//TODO:send email to verifier
-	go sendEmail(bet.BettorEmail, subject, content)
+	go sendEmail(bet.VerifierEmail, subject, content)
 
 	c.JSON(http.StatusOK, gin.H{"message": "Proof uploaded successfully"})
 }
 
 func verifyProof(c *gin.Context) {
 	betID := c.Param("id")
-	var payload struct {
-		Approved bool `json:"approved"`
-	}
-
-	if err := c.BindJSON(&payload); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request body"})
-		return
-	}
+	action := c.Param("action")
 
 	bet, exists := betStore[betID]
 	if !exists {
@@ -322,9 +323,7 @@ func verifyProof(c *gin.Context) {
 		return
 	}
 
-	fmt.Println(payload)
-
-	if payload.Approved {
+	if action == "approve" {
 		bet.Status = "approved"
 	} else {
 		bet.Status = "rejected"
